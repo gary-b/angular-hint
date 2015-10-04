@@ -78,6 +78,62 @@ function decorateRootScope($delegate, $parse) {
   var _watch = scopePrototype.$watch;
   var _digestEvents = [];
   var skipNextPerfWatchers = false;
+  var currentWatchEvent = null;
+  var postDigestQueueStartTime = null;
+  var digestStart = null;
+  var watchStart = null;
+  var preWatchTime = 0;
+  var postDigestQueueTime = 0;
+
+  // detect when postDigestQueue is being processed, so we don't include this digest time with last watch
+  $delegate.$$postDigestQueue.shift = function () {
+    /* the first time $$postDigestQueue.shift() is called after the last watch cycle marks
+     the start of the postDigestQueue processing */
+    if (!postDigestQueueStartTime) {
+      postDigestQueueStartTime = perf.now();
+    }
+    return Array.prototype.shift.apply($delegate.$$postDigestQueue);
+  };
+
+  // function called at the end of $digest to reconcile any postDigestQueue processing time
+  function accountForPostDigestQueue () {
+    if (postDigestQueueStartTime) {
+      if (_digestEvents.length) {
+        _digestEvents[_digestEvents.length - 1].digestTime = postDigestQueueStartTime - watchStart;
+      }
+      postDigestQueueTime = perf.now() - postDigestQueueStartTime;
+    } else {
+      postDigestQueueTime = 0;
+    }
+  }
+
+  // setup currentWatchEvent at start of digest cycle
+  function setupNextWatchEvent (watchStr, scopeId) {
+    /* if $$postDigestQueue.shift() was called ignore it, as we haven't reached end of all digest
+     cycles */
+    postDigestQueueStartTime = null;
+    currentWatchEvent = {
+      eventType: 'scope:watch',
+      id: scopeId,
+      watch: watchStr,
+      digestTime: null,
+      watchExpressionTime: null,
+      reactionFunctionTime: 0 // default to 0 as reaction function may not execute
+    };
+    watchStart = perf.now();
+  }
+
+  // record end of digest cycle for currentWatchEvent. If there is none record pre watch time
+  function completePreviousWatchEvent () {
+    if (currentWatchEvent) {
+      currentWatchEvent.digestTime = perf.now() - watchStart;
+      _digestEvents.push(currentWatchEvent);
+      currentWatchEvent = null;
+    } else {
+      preWatchTime = perf.now() - digestStart;
+    }
+  }
+
   scopePrototype.$watch = function (watchExpression, reactionFunction) {
     // if `skipNextPerfWatchers` is true, this means the previous run of the
     // `$watch` decorator was a one time binding expression and this invocation
@@ -108,29 +164,23 @@ function decorateRootScope($delegate, $parse) {
       }
 
       arguments[0] = function () {
+        completePreviousWatchEvent();
+        setupNextWatchEvent(watchStr, scopeId);
         var start = perf.now();
         var ret = watchExpression.apply(this, arguments);
         var end = perf.now();
-        _digestEvents.push({
-          eventType: 'scope:watch',
-          id: scopeId,
-          watch: watchStr,
-          time: end - start
-        });
+        currentWatchEvent.watchExpressionTime = end - start;
         return ret;
       };
     } else {
       var thatScope = this;
       arguments[0] = function () {
+        completePreviousWatchEvent();
+        setupNextWatchEvent(watchStr, scopeId);
         var start = perf.now();
         var ret = thatScope.$eval(watchExpression);
         var end = perf.now();
-        _digestEvents.push({
-          eventType: 'scope:watch',
-          id: scopeId,
-          watch: watchStr,
-          time: end - start
-        });
+        currentWatchEvent.watchExpressionTime = end - start;
         return ret;
       };
     }
@@ -140,12 +190,10 @@ function decorateRootScope($delegate, $parse) {
         var start = perf.now();
         var ret = reactionFunction.apply(this, arguments);
         var end = perf.now();
-        _digestEvents.push({
-          eventType: 'scope:reaction',
-          id: this.$id,
-          watch: watchStr,
-          time: end - start
-        });
+        /* if $$postDigestQueue.shift() was called ignore it as we haven't reached end of all
+         digest cycles */
+        postDigestQueueStartTime = null;
+        currentWatchEvent.reactionFunctionTime = end - start;
         return ret;
       };
     }
@@ -154,15 +202,19 @@ function decorateRootScope($delegate, $parse) {
   };
 
   var _digest = scopePrototype.$digest;
-  scopePrototype.$digest = function (fn) {
+  scopePrototype.$digest = function () {
     _digestEvents = [];
-    var start = perf.now();
+    digestStart = perf.now();
     var ret = _digest.apply(this, arguments);
     var end = perf.now();
+    completePreviousWatchEvent();
+    accountForPostDigestQueue();
     hint.emit('scope:digest', {
       id: this.$id,
-      time: end - start,
-      events: _digestEvents
+      time: end - digestStart,
+      events: _digestEvents,
+      postDigestQueueTime: postDigestQueueTime,
+      preWatchTime: preWatchTime
     });
     return ret;
   };
